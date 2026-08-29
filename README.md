@@ -45,10 +45,14 @@ Both `~/Library/Trial` and `/Library/Trial` should show `writes: blocked` and `m
 Then log out and back in (reboot if you also want the boot job for `/Library/Trial`). After login:
 
 ```bash
+make test
+# or:
 fapple status
 touch ~/Library/Trial/x          # should fail: Read-only file system
 sudo touch /Library/Trial/x      # should fail: Read-only file system
 ```
+
+`make test` runs `fapple status` and those write probes; it fails if either path is writable.
 
 `local.fapple` remounts the user path at login. `local.fapple.system` remounts `/Library/Trial` at boot.
 
