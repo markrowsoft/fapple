@@ -2,16 +2,23 @@
 
 Make `~/Library/Trial` **unwritable to Apple’s `triald`**.
 
-`triald` (a per-user LaunchAgent at `/usr/libexec/triald`) stores CloudKit experiment data in `~/Library/Trial`. There is no official off switch. `fapple` covers that path with a 1 MB disk **mounted read-only**, so `triald` gets `Read-only file system` and cannot store files.
+That is the whole product. `triald` is a per-user LaunchAgent (`/usr/libexec/triald`) that writes CloudKit experiment files into `~/Library/Trial`. There is no official off switch. `fapple` exists to make that path unusable for it.
 
-A full-but-read-write volume is **not** enough. `triald` can delete `filler.binary` and then write. The mount must be read-only.
+`triald` can still *run*; it just cannot store anything in `~/Library/Trial`.
+
+## Why a full disk is not enough
+
+A 1 MB volume filled with `filler.binary` looks blocked (`No space left on device`), but it is **not**. `triald` runs as you, so it can delete `filler.binary` and then write. A normal `unlink` clears the filler and the volume goes back to having free space.
+
+The mount must be **read-only**. Then `triald` gets `Read-only file system` for both creates and deletes.
 
 ## What it does
 
 1. Reuses the existing 1 MB image if one is already there (never 1 GB)
 2. Empties that user’s `~/Library/Trial` host folder
-3. Mounts the image **read-only** at `~/Library/Trial`
+3. Covers `~/Library/Trial` with that image **mounted read-only**
 4. Probes a write and fails if `triald` would still succeed
+5. Remounts read-only at login (`local.fapple`)
 
 If the image file is writable (first-time setup as root), `fapple` also fills it, then `chmod a-w` / `chflags uchg` the `.dmg` so later user attaches stay read-only.
 
@@ -44,6 +51,19 @@ Success looks like:
 ```
 writes:       blocked (triald cannot write)
 mount flags:  read-only
+```
+
+Write probes that must fail:
+
+```bash
+touch ~/Library/Trial/triald-test
+# touch: ~/Library/Trial/triald-test: Read-only file system
+
+rm ~/Library/Trial/filler.binary
+# rm: ~/Library/Trial/filler.binary: Read-only file system
+
+fapple status
+# writes:       blocked (triald cannot write)
 ```
 
 ## Related
