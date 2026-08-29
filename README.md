@@ -1,74 +1,63 @@
 # fapple
 
-Make `~/Library/Trial` **unwritable to Apple’s `triald`**.
+Make Apple Trial directories **unwritable to `triald` / `triald_system`**.
 
-The volume is **1 MB on purpose**, not 1 GB, so it is easy to fill. That tiny disk is **broken on purpose**: once `filler.binary` occupies every free byte, `triald` gets `No space left on device` and cannot store experiment data.
+The volume is **1 MB on purpose**, not 1 GB, so it is easy to fill. That tiny disk is **broken on purpose**: once `filler.binary` occupies every free byte, writes fail with `No space left on device`. The image is then mounted **read-only** so the daemon cannot delete the filler and free space again.
 
-`triald` is a per-user LaunchAgent (`/usr/libexec/triald`) that writes CloudKit experiment files into `~/Library/Trial`. There is no official off switch. `fapple` covers that path with the 1 MB image, fills it, and keeps it mounted at `~/Library/Trial`.
+Apple runs two jobs. Neither can be lastingly disabled (SIP + XPC restart them):
 
-`triald` can still *run*; it just cannot store anything in `~/Library/Trial`.
+| Process | Writes to |
+|---|---|
+| `/usr/libexec/triald` (LaunchAgent) | `~/Library/Trial` |
+| `/usr/libexec/triald_system` (LaunchDaemon) | `/Library/Trial` |
 
-## Why 1 MB
+`fapple` occupies **both** (system path needs sudo). It does **not** try to stop the daemons. It deletes files that are not open, then attaches the 1 MB disk before they recreate anything. Open files are skipped until the holder drops the FD; if they remain, `triald` is signaled only so FDs drop — it will restart onto the read-only mount.
 
-A 1 GB (or even an empty 1 MB) disk would give `triald` room to write. One megabyte fills in a moment. `fapple` will refuse any other size.
-
-The image is also mounted **read-only** so `triald` cannot delete `filler.binary` and free space again.
+The daemons can still *run*; they just cannot store experiment data.
 
 ## What it does
 
-1. Reuses the existing 1 MB image if one is already there (never 1 GB)
-2. Empties that user’s `~/Library/Trial` host folder
-3. Mounts the image at `~/Library/Trial`, fills it if needed, then remounts **read-only**
-4. Probes a write and fails if `triald` would still succeed
-5. Remounts at login (`local.fapple`)
+1. Reuses each existing 1 MB image (never 1 GB)
+2. Deletes unopened files under `~/Library/Trial` and `/Library/Trial`
+3. Mounts a 1 MB image **read-only** at each path
+4. Probes a write and fails if Trial would still be writable
+5. Remounts `~/Library/Trial` at login and `/Library/Trial` at boot
 
 ## Install
 
 ```bash
 sudo make install
 # or
-sudo ./fapple install
+sudo fapple install
 ```
 
-Copies `fapple` to `/usr/local/bin/fapple`.
+Copies `fapple` to `/usr/local/bin/fapple`, occupies both Trial dirs, and enables auto-mount.
 
 ## Usage
 
 ```bash
-sudo fapple                 # create 1 MB disk if needed, fill it, remount read-only
-sudo fapple mount           # empty Trial and remount the existing 1 MB disk
-fapple status               # must say writes: blocked
-fapple enable-auto-mount    # remount at login
-fapple disable-auto-mount
+sudo fapple                 # occupy ~/Library/Trial and /Library/Trial
+sudo fapple mount           # same: empty unopened files, remount read-only
+fapple status               # both paths must say writes: blocked
 sudo fapple unmount
 sudo fapple destroy
 ```
 
-Default mount point is the calling user’s `~/Library/Trial`.
-
-Success looks like:
+Success:
 
 ```
-writes:       blocked (triald cannot write)
-mount flags:  read-only
-```
+user triald (~/Library/Trial):
+  writes:       blocked
+  mount flags:  read-only
 
-Write probes that must fail:
-
-```bash
-touch ~/Library/Trial/triald-test
-# Read-only file system  (or No space left on device)
-
-rm ~/Library/Trial/filler.binary
-# Read-only file system
-
-fapple status
-# writes:       blocked (triald cannot write)
+triald_system (/Library/Trial):
+  writes:       blocked
+  mount flags:  read-only
 ```
 
 ## Related
 
-Companion to [Puck Apple Trials](https://github.com/markrowsoft/Fuck_Apple_Trials), which notifies you when Trial files appear.
+Companion to [Puck Apple Trials](https://github.com/markrowsoft/Fuck_Apple_Trials).
 
 ## License
 
