@@ -33,6 +33,25 @@ sudo fapple install
 
 Copies `fapple` to `/usr/local/bin/fapple`, occupies both Trial dirs, and enables auto-mount.
 
+## Test after logout
+
+```bash
+sudo fapple install
+fapple status
+```
+
+Both `~/Library/Trial` and `/Library/Trial` should show `writes: blocked` and `mount flags: read-only`.
+
+Then log out and back in (reboot if you also want the boot job for `/Library/Trial`). After login:
+
+```bash
+fapple status
+touch ~/Library/Trial/x          # should fail: Read-only file system
+sudo touch /Library/Trial/x      # should fail: Read-only file system
+```
+
+`local.fapple` remounts the user path at login. `local.fapple.system` remounts `/Library/Trial` at boot.
+
 ## Usage
 
 ```bash
