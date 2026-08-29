@@ -1,20 +1,19 @@
 # fapple
 
-Occupy `~/Library/Trial` with a **1 MB** disk so Apple’s `triald` has nowhere to write.
+Make `~/Library/Trial` **unwritable to Apple’s `triald`**.
 
-The volume is **1 megabyte**, not 1 GB. It is **filled to 100% on purpose**. Writes failing with `No space left on device` is the point, not a bug.
+`triald` (a per-user LaunchAgent at `/usr/libexec/triald`) stores CloudKit experiment data in `~/Library/Trial`. There is no official off switch. `fapple` covers that path with a 1 MB disk **mounted read-only**, so `triald` gets `Read-only file system` and cannot store files.
+
+A full-but-read-write volume is **not** enough. `triald` can delete `filler.binary` and then write. The mount must be read-only.
 
 ## What it does
 
-Apple’s Trial system (managed by `triald`) drops CloudKit experiment data in `~/Library/Trial`. `fapple` attaches a tiny HFS+ disk image at that path so the directory is a mount point instead of a writable folder on the boot volume, then fills the image until it is full.
+1. Reuses the existing 1 MB image if one is already there (never 1 GB)
+2. Empties that user’s `~/Library/Trial` host folder
+3. Mounts the image **read-only** at `~/Library/Trial`
+4. Probes a write and fails if `triald` would still succeed
 
-If the 1 MB disk **already exists**, `fapple` does not recreate it (that would un-break it). It:
-
-1. Unmounts the disk if it is attached somewhere else
-2. Makes sure that user’s `~/Library/Trial` directory is empty
-3. Remounts the same already-full disk there
-
-Each user with sudo can point the same small disk at **their** `~/Library/Trial`.
+If the image file is writable (first-time setup as root), `fapple` also fills it, then `chmod a-w` / `chflags uchg` the `.dmg` so later user attaches stay read-only.
 
 ## Install
 
@@ -24,27 +23,28 @@ sudo make install
 sudo ./fapple install
 ```
 
-That copies `fapple` to `/usr/local/bin/fapple` so any user on the Mac can run it (sudo required for create / physical partitions).
+Copies `fapple` to `/usr/local/bin/fapple`.
 
 ## Usage
 
 ```bash
-sudo fapple                 # create the 1 MB disk if needed, empty ~/Library/Trial, remount
-sudo fapple mount           # empty ~/Library/Trial and remount the existing 1 MB disk
-sudo fapple unmount
-sudo fapple status
-sudo fapple destroy
-fapple enable-auto-mount    # remount at login for this user
+sudo fapple                 # create 1 MB disk if needed, empty Trial, remount read-only
+sudo fapple mount           # empty Trial and remount the existing disk read-only
+fapple status               # must say writes: blocked
+fapple enable-auto-mount    # remount read-only at login
 fapple disable-auto-mount
+sudo fapple unmount         # unmount, then chmod 000 the host folder
+sudo fapple destroy
 ```
 
-Default mount point is the calling user’s `~/Library/Trial` (the sudoer’s home when run via `sudo`). Override with `--mount-point`.
+Default mount point is the calling user’s `~/Library/Trial`.
 
-## Why 1 MB, not 1 GB
+Success looks like:
 
-A 1 GB (or even an empty 1 MB) disk would give `triald` room to write. The image is tiny and then stuffed with `filler.binary` until capacity is 100%. That is broken on purpose. `fapple` will refuse any size other than 1 MB.
-
-Internal APFS boot disks usually have no spare GPT room, so the default is a disk image rather than a real partition. Pass `--partition DISK` only when you have free space on an external disk.
+```
+writes:       blocked (triald cannot write)
+mount flags:  read-only
+```
 
 ## Related
 
