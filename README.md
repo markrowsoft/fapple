@@ -33,6 +33,8 @@ sudo fapple install
 
 Copies `fapple` to `/usr/local/bin/fapple`, occupies both Trial dirs, and enables auto-mount.
 
+If `fapple` is already in `/usr/local/bin` (including when another user on this Mac runs `fapple install`), it only occupies that user's `~/Library/Trial` and enables their login auto-mount. It does not install the boot job, occupy `/Library/Trial`, or add a second background item.
+
 ## Test after logout
 
 ```bash

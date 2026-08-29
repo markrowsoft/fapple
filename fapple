@@ -72,7 +72,8 @@ Commands:
   destroy             Unmount and delete the images
   enable-auto-mount   Remount at login, and at boot for /Library/Trial if sudo
   disable-auto-mount  Remove the login/boot auto-mount jobs
-  install             Install to /usr/local/bin and occupy both Trial dirs
+  install             Install to /usr/local/bin and occupy both Trial dirs.
+                      If already installed, only occupy this user's ~/Library/Trial
   status              Print current disk / mount info
   help                Show this help
 
@@ -204,8 +205,9 @@ load_state() {
 }
 
 save_state() {
-  if mkdir -p "${STATE_DIR}" 2>/dev/null; then
-    cat > "${STATE_FILE}" <<EOF
+  mkdir -p "${STATE_DIR}" 2>/dev/null || return 0
+  [[ -w "${STATE_DIR}" ]] || return 0
+  cat > "${STATE_FILE}" <<EOF
 MODE='${MODE}'
 MOUNT_POINT='${MOUNT_POINT}'
 IMAGE_PATH='${IMAGE_PATH}'
@@ -213,8 +215,7 @@ PARTITION_DISK='${PARTITION_DISK}'
 DEVICE='${DEVICE:-}'
 VOLUME_NAME='${VOLUME_NAME}'
 EOF
-    chmod 600 "${STATE_FILE}" 2>/dev/null || true
-  fi
+  chmod 600 "${STATE_FILE}" 2>/dev/null || true
 }
 
 pick_existing_image() {
@@ -920,12 +921,51 @@ disable_auto_mount() {
   echo "disabled auto-mount"
 }
 
-install_self() {
-  local src dest dir
+fapple_is_installed() {
+  [[ -x "${INSTALL_PATH}" ]]
+}
+
+# Copy this script to INSTALL_PATH when dest is writable. Returns 0 if
+# dest already matches src or the copy succeeded; 1 if dest could not
+# be written. Does not occupy Trial or touch launchd.
+update_installed_copy() {
+  local src dest
   src="$(script_self)"
   dest="${INSTALL_PATH}"
-  dir="$(dirname "${dest}")"
-  mkdir -p "${dir}"
+  if [[ -x "${dest}" ]] && cmp -s "${src}" "${dest}" 2>/dev/null; then
+    return 0
+  fi
+  [[ "${src}" != "${dest}" ]] || return 0
+  mkdir -p "$(dirname "${dest}")" 2>/dev/null || true
+  if install -m 0755 "${src}" "${dest}" 2>/dev/null; then
+    echo "installed ${dest}"
+    return 0
+  fi
+  return 1
+}
+
+# First-time install copies the binary, occupies both Trial dirs, and
+# enables login + boot auto-mount. If the binary is already in place
+# (another user on this Mac, or a re-run), only this user's
+# ~/Library/Trial is occupied — no LaunchDaemon, no /Library/Trial.
+install_self() {
+  local src dest
+  src="$(script_self)"
+  dest="${INSTALL_PATH}"
+
+  if fapple_is_installed; then
+    if update_installed_copy; then
+      echo "already installed: ${dest}"
+    else
+      echo "already installed: ${dest} (script not rewritten; needs sudo to update)"
+    fi
+    echo "occupying this user's $(default_mount_point) only"
+    occupy_target "$(user_image_path)" "$(default_mount_point)" "${VOLUME_NAME:-fapple}"
+    enable_auto_mount_agent
+    return 0
+  fi
+
+  mkdir -p "$(dirname "${dest}")"
   if ! install -m 0755 "${src}" "${dest}" 2>/dev/null; then
     die "cannot write ${dest}; run: sudo $0 install"
   fi

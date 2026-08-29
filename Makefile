@@ -9,6 +9,7 @@ SYSTEM_TRIAL ?= /Library/Trial
 
 # Copies fapple to $(BINDIR), occupies ~/Library/Trial and /Library/Trial,
 # and installs login + boot auto-mount jobs. Needs sudo for /Library/Trial.
+# If fapple is already installed, only occupies this user's ~/Library/Trial.
 install:
 	./fapple install
 
