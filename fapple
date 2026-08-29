@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# fapple — occupy ~/Library/Trial with a 1 MB disk so Apple's triald
-# cannot write there.
+# fapple — make Apple Trial dirs unwritable to triald / triald_system.
 #
-# The volume is 1 megabyte (hdiutil -size 1m), never 1 GB.
-# If that small disk already exists, this only empties the user's
-# ~/Library/Trial directory and remounts the same disk there.
+# The volume is 1 MB on purpose (never 1 GB) so it is easy to fill.
+# That tiny disk is broken on purpose: filler.binary occupies every
+# free byte, then the image is mounted read-only so triald cannot
+# delete the filler and write again.
+#
+# User agent triald writes ~/Library/Trial. System daemon triald_system
+# writes /Library/Trial. Both get a 1 MB read-only image. Do not try to
+# disable the daemons — SIP / XPC will restart them. Delete files that
+# are not open, then mount before they recreate anything.
 set -euo pipefail
 
 VOLUME_NAME="fapple"
@@ -22,8 +27,13 @@ LEGACY_STATE_DIR="/usr/local/var/trialdisk"
 LEGACY_IMAGE_PATH="${LEGACY_STATE_DIR}/trialdisk.dmg"
 
 LAUNCHD_LABEL="local.fapple"
+SYSTEM_LAUNCHD_LABEL="local.fapple.system"
 LEGACY_LAUNCHD_LABEL="local.trialdisk"
 LAUNCHD_PLIST="/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist"
+SYSTEM_LAUNCHD_PLIST="/Library/LaunchDaemons/${SYSTEM_LAUNCHD_LABEL}.plist"
+SYSTEM_MOUNT="/Library/Trial"
+SYSTEM_IMAGE_PATH="${STATE_DIR}/fapple-system.dmg"
+SYSTEM_VOLUME_NAME="fapplesys"
 USER_IMAGE_SUBDIR="Library/Application Support/fapple"
 USER_IMAGE_NAME="fapple.dmg"
 LEGACY_USER_IMAGE_SUBDIR="Library/Application Support/trialdisk"
@@ -44,24 +54,25 @@ DEVICE=""
 
 usage() {
   cat <<'EOF'
-fapple — occupy ~/Library/Trial with a 1 MB disk (not 1 GB).
+fapple — make Trial dirs unwritable to triald / triald_system.
 
-If the small disk already exists, fapple does not recreate it. It
-empties the calling user's ~/Library/Trial directory, then remounts
-the same disk there.
+1 MB on purpose so the volume is easy to fill, then mount read-only
+at ~/Library/Trial and (with sudo) /Library/Trial. Do not disable
+the daemons; they will restart. Delete files that are not open,
+then attach before they create new ones.
 
 Usage:
   sudo fapple [command] [options]
 
 Commands:
-  up                  Create the 1 MB disk if needed, then remount (default)
-  create              Create the 1 MB disk only
-  mount               Empty ~/Library/Trial and remount the existing disk
-  unmount             Unmount (disk image stays on disk)
-  destroy             Unmount and delete the image or partition
-  enable-auto-mount   Remount at login (or at boot if run with sudo)
-  disable-auto-mount  Remove the login/boot auto-mount job
-  install             Install this script to /usr/local/bin/fapple
+  up                  Create 1 MB disks if needed, then occupy both Trial dirs
+  create              Create the 1 MB disk(s) only
+  mount               Empty Trial dirs (skip open files) and remount read-only
+  unmount             Unmount (images stay on disk)
+  destroy             Unmount and delete the images
+  enable-auto-mount   Remount at login, and at boot for /Library/Trial if sudo
+  disable-auto-mount  Remove the login/boot auto-mount jobs
+  install             Install to /usr/local/bin and occupy both Trial dirs
   status              Print current disk / mount info
   help                Show this help
 
@@ -75,10 +86,9 @@ Options:
 
 Examples:
   sudo fapple
+  sudo fapple install
   sudo fapple mount
   sudo fapple status
-  sudo fapple install
-  fapple enable-auto-mount
 EOF
 }
 
@@ -169,7 +179,7 @@ safe_mount_point() {
   home="$(user_home)"
   [[ "${mp}" == /* ]] || die "mount point must be an absolute path: ${mp}"
   case "${mp}" in
-    /|"/Users"|"${home}"|"${home}/Library"|"${home}/Library/")
+    /|"/Users"|"${home}"|"${home}/Library"|"${home}/Library/"|"/Library"|"/Library/"|"/System"|"/System/"|"/System/Library"|"/System/Library/")
       die "refusing to use ${mp} as a mount point"
       ;;
   esac
@@ -294,39 +304,195 @@ detach_image() {
   fi
 }
 
+unlock_host_dir() {
+  local mp="${1:-${MOUNT_POINT}}"
+  mkdir -p "${mp}"
+  chmod u+rwx "${mp}" 2>/dev/null || chmod 0755 "${mp}" 2>/dev/null || true
+  chflags nouchg,noschg "${mp}" 2>/dev/null || true
+}
+
+# If the image is not covering Trial, stop triald from using the host folder.
+lock_host_dir() {
+  local mp="${1:-${MOUNT_POINT}}"
+  [[ -d "${mp}" ]] || return 0
+  [[ -z "$(mounted_at "${mp}")" ]] || return 0
+  chmod 000 "${mp}" 2>/dev/null || true
+}
+
+dir_has_children() {
+  [[ -n "$(find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]]
+}
+
+# Delete names that are not open. Open files stay until the holder
+# drops the FD — do not disable triald; it will restart anyway.
+delete_unopened() {
+  local mp="$1"
+  local f
+  while IFS= read -r f; do
+    [[ -e "${f}" || -L "${f}" ]] || continue
+    if lsof -t "${f}" >/dev/null 2>&1; then
+      echo "skip open file: ${f}"
+      continue
+    fi
+    /bin/rm -rf "${f}" 2>/dev/null || true
+  done < <(find "${mp}" -depth -mindepth 1 2>/dev/null || true)
+}
+
+triald_holders() {
+  local mp="$1"
+  local pid comm
+  dir_has_children "${mp}" || return 0
+  while IFS= read -r pid; do
+    [[ -n "${pid}" && "${pid}" != "$$" && "${pid}" != "${PPID}" ]] || continue
+    comm="$(ps -p "${pid}" -o comm= 2>/dev/null || true)"
+    case "${comm}" in
+      *triald*) printf '%s\n' "${pid}" ;;
+    esac
+  done < <(find "${mp}" -print0 2>/dev/null | xargs -0 lsof -t 2>/dev/null | sort -u)
+}
+
 empty_mount_dir() {
   local mp="$1"
+  local i pids pid
+  local home
+  home="$(user_home)"
   safe_mount_point "${mp}"
   if [[ -n "$(mounted_at "${mp}")" ]]; then
     die "cannot empty ${mp}: still mounted"
   fi
-  mkdir -p "${mp}"
-  if [[ ${EUID} -eq 0 ]]; then
+  unlock_host_dir "${mp}"
+  if [[ ${EUID} -eq 0 && "${mp}" == "${home}"/* ]]; then
     chown "$(user_account):staff" "${mp}" 2>/dev/null \
       || chown "$(user_account)" "${mp}" 2>/dev/null \
       || true
   fi
-  if [[ -n "$(find "${mp}" -mindepth 1 -maxdepth 1 2>/dev/null || true)" ]]; then
-    echo "emptying ${mp}"
-    find "${mp}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  echo "deleting unopened files in ${mp}"
+  delete_unopened "${mp}"
+  for i in 1 2 3 4 5; do
+    dir_has_children "${mp}" || return 0
+    echo "waiting for open files in ${mp} to close (${i}/5)"
+    sleep 1
+    delete_unopened "${mp}"
+  done
+  if dir_has_children "${mp}"; then
+    pids="$(triald_holders "${mp}" || true)"
+    if [[ -n "${pids}" ]]; then
+      echo "signaling triald holders so FDs drop (process will restart): ${pids}"
+      while IFS= read -r pid; do
+        [[ -n "${pid}" ]] || continue
+        kill -TERM "${pid}" 2>/dev/null || true
+      done <<<"${pids}"
+      sleep 0.4
+      delete_unopened "${mp}"
+    fi
   fi
-  if [[ -n "$(find "${mp}" -mindepth 1 -maxdepth 1 2>/dev/null || true)" ]]; then
-    die "mount point ${mp} is not empty"
+  if dir_has_children "${mp}"; then
+    die "mount point ${mp} is not empty (files still open)"
   fi
 }
 
+volume_free_bytes() {
+  df -b "${MOUNT_POINT}" 2>/dev/null | awk 'NR==2 {print $4 * 512; exit}'
+}
+
+is_readonly_mount() {
+  mount | awk -v mp="$1" '$3 == mp && $0 ~ /read-only/ {found=1} END {exit !found}'
+}
+
+trial_is_writable() {
+  local probe="${MOUNT_POINT}/.fapple-write-probe"
+  if ( : > "${probe}" ) 2>/dev/null; then
+    /bin/rm -f "${probe}" 2>/dev/null || true
+    return 0
+  fi
+  return 1
+}
+
+harden_image_file() {
+  [[ -f "${IMAGE_PATH}" ]] || return 0
+  chflags nouchg "${IMAGE_PATH}" 2>/dev/null || true
+  chmod a-w "${IMAGE_PATH}" 2>/dev/null || true
+  chflags uchg "${IMAGE_PATH}" 2>/dev/null || true
+}
+
+attach_image() {
+  local readonly="$1"
+  local -a args
+  args=(attach "${IMAGE_PATH}" -mountpoint "${MOUNT_POINT}" -nobrowse)
+  if [[ "${readonly}" == "1" ]]; then
+    args+=(-readonly)
+  fi
+  hdiutil "${args[@]}"
+}
+
+# Fill until ENOSPC when the volume is writable. Then the image is
+# remounted read-only so triald cannot delete the filler and write.
 fill_volume() {
-  local dest avail
+  local dest free
   dest="${MOUNT_POINT}/filler.binary"
-  [[ -e "${dest}" ]] && return 0
-  avail="$(df -k "${MOUNT_POINT}" | awk 'NR==2 {print $4}')"
-  [[ -n "${avail}" && "${avail}" -gt 64 ]] || return 0
-  echo "filling remaining space on ${MOUNT_POINT}"
-  dd if=/dev/zero of="${dest}" bs=1024 count="$((avail - 32))" 2>/dev/null || true
+  trial_is_writable || {
+    echo "Trial is not writable"
+    return 0
+  }
+  free="$(volume_free_bytes || echo 0)"
+  [[ -n "${free}" && "${free}" -gt 0 ]] || return 0
+  echo "filling ${MOUNT_POINT} so a RW remount would still be full"
+  dd if=/dev/zero of="${dest}" bs=4096 conv=notrunc 2>/dev/null || true
+}
+
+verify_unwritable() {
+  if trial_is_writable; then
+    die "${MOUNT_POINT} is still writable; triald would not be blocked"
+  fi
+  if is_readonly_mount "${MOUNT_POINT}"; then
+    echo "Trial is unwritable (read-only mount); triald is blocked"
+  else
+    echo "Trial is unwritable; triald is blocked"
+  fi
+}
+
+report_mount() {
+  local free
+  free="$(volume_free_bytes || echo unknown)"
+  echo "mounted ${VOLUME_NAME} at ${MOUNT_POINT}"
+  echo "free space: ${free} bytes"
+  verify_unwritable
+}
+
+trial_already_blocked() {
+  [[ -n "$(mounted_at "${MOUNT_POINT}")" ]] || return 1
+  is_readonly_mount "${MOUNT_POINT}" || return 1
+  trial_is_writable && return 1
+  return 0
+}
+
+ensure_hfs_image() {
+  local path="$1"
+  local vol="$2"
+  assert_size_is_small
+  if [[ -f "${path}" ]] && image_is_hfs "${path}"; then
+    echo "1 MB disk already exists: ${path}"
+    return 0
+  fi
+  if [[ -f "${path}" ]]; then
+    echo "replacing non-HFS image ${path}"
+    chflags nouchg "${path}" 2>/dev/null || true
+    chmod u+w "${path}" 2>/dev/null || true
+    rm -f "${path}"
+  fi
+  mkdir -p "$(dirname "${path}")"
+  echo "creating 1 MB HFS+ image ${path} (volume ${vol})"
+  hdiutil create \
+    -size "${SIZE}" \
+    -layout "${IMAGE_LAYOUT}" \
+    -fs "${IMAGE_FS}" \
+    -volname "${vol}" \
+    -ov \
+    "${path}" >/dev/null
+  echo "created ${path}"
 }
 
 create_image() {
-  assert_size_is_small
   local existing
   if existing="$(pick_existing_image)" && image_is_hfs "${existing}"; then
     IMAGE_PATH="${existing}"
@@ -334,39 +500,70 @@ create_image() {
     save_state
     return 0
   fi
-  if [[ -f "${IMAGE_PATH}" ]]; then
-    echo "replacing non-HFS image (macOS will not mount MS-DOS on ~/Library)"
-    detach_image
-    rm -f "${IMAGE_PATH}"
-  fi
-  mkdir -p "$(dirname "${IMAGE_PATH}")"
-  echo "creating 1 MB HFS+ image ${IMAGE_PATH} (volume ${VOLUME_NAME})"
-  hdiutil create \
-    -size "${SIZE}" \
-    -layout "${IMAGE_LAYOUT}" \
-    -fs "${IMAGE_FS}" \
-    -volname "${VOLUME_NAME}" \
-    -ov \
-    "${IMAGE_PATH}" >/dev/null
-  echo "created ${IMAGE_PATH}"
+  ensure_hfs_image "${IMAGE_PATH}" "${VOLUME_NAME}"
   save_state
+}
+
+occupy_target() {
+  local image="$1"
+  local mp="$2"
+  local vol="$3"
+  CLI_IMAGE="${image}"
+  CLI_MOUNT="${mp}"
+  IMAGE_PATH="${image}"
+  MOUNT_POINT="${mp}"
+  VOLUME_NAME="${vol}"
+  safe_mount_point "${MOUNT_POINT}"
+  ensure_hfs_image "${IMAGE_PATH}" "${VOLUME_NAME}"
+  mount_image
+}
+
+occupy_user_trial() {
+  resolve_image_path
+  occupy_target "${IMAGE_PATH}" "$(default_mount_point)" "${VOLUME_NAME:-fapple}"
+}
+
+occupy_system_trial() {
+  need_root "mount /Library/Trial"
+  occupy_target "${SYSTEM_IMAGE_PATH}" "${SYSTEM_MOUNT}" "${SYSTEM_VOLUME_NAME}"
+}
+
+occupy_defaults() {
+  occupy_user_trial
+  if [[ ${EUID} -eq 0 ]]; then
+    occupy_system_trial
+  else
+    echo "skipping ${SYSTEM_MOUNT} (needs sudo); user Trial is occupied"
+  fi
 }
 
 mount_image() {
   local skip_empty="${1:-0}"
+  local attach_out
   resolve_image_path
   [[ -f "${IMAGE_PATH}" ]] || die "no 1 MB disk at ${IMAGE_PATH}; run: sudo $0 create"
-  if [[ "${skip_empty}" == "1" && -n "$(mounted_at "${MOUNT_POINT}")" ]]; then
-    echo "already mounted at ${MOUNT_POINT}"
+  if trial_already_blocked; then
+    echo "already blocking triald at ${MOUNT_POINT} (read-only)"
     DEVICE="$(mounted_at "${MOUNT_POINT}")"
     save_state
     return 0
   fi
   detach_image
   empty_mount_dir "${MOUNT_POINT}"
-  echo "attaching ${IMAGE_PATH} at ${MOUNT_POINT}"
-  local attach_out
-  if ! attach_out="$(hdiutil attach "${IMAGE_PATH}" -mountpoint "${MOUNT_POINT}" -nobrowse 2>&1)"; then
+  if [[ -w "${IMAGE_PATH}" ]]; then
+    echo "attaching ${IMAGE_PATH} read-write to fill it"
+    if ! attach_out="$(attach_image 0 2>&1)"; then
+      echo "${attach_out}" >&2
+    else
+      echo "${attach_out}"
+      fill_volume
+      detach_image
+      empty_mount_dir "${MOUNT_POINT}"
+    fi
+    harden_image_file
+  fi
+  echo "attaching ${IMAGE_PATH} read-only at ${MOUNT_POINT}"
+  if ! attach_out="$(attach_image 1 2>&1)"; then
     echo "${attach_out}" >&2
     if [[ "${attach_out}" == *"no mountable file systems"* ]]; then
       die "attach failed at ${MOUNT_POINT}. MS-DOS/FAT will not mount on ~/Library; recreate as HFS+"
@@ -375,9 +572,8 @@ mount_image() {
   fi
   echo "${attach_out}"
   DEVICE="$(awk '/\/dev\/disk[0-9]+/ {print $1; exit}' <<<"${attach_out}")"
-  fill_volume
   save_state
-  echo "mounted ${VOLUME_NAME} at ${MOUNT_POINT}"
+  report_mount
 }
 
 unmount_image() {
@@ -389,14 +585,18 @@ unmount_image() {
     detach_image
     echo "not mounted"
   fi
+  lock_host_dir
 }
 
 destroy_image() {
   unmount_image
   if [[ -f "${IMAGE_PATH}" ]]; then
+    chflags nouchg "${IMAGE_PATH}" 2>/dev/null || true
+    chmod u+w "${IMAGE_PATH}" 2>/dev/null || true
     rm -f "${IMAGE_PATH}"
     echo "deleted ${IMAGE_PATH}"
   fi
+  unlock_host_dir
   rmdir "${MOUNT_POINT}" 2>/dev/null || true
   rm -f "${STATE_FILE}"
   if [[ -f "${LAUNCHD_PLIST}" ]] || auto_mount_loaded_system || auto_mount_loaded_user || [[ -f "$(user_plist_path)" ]]; then
@@ -442,8 +642,8 @@ mount_partition() {
   local dev
   dev="${DEVICE:-$(volume_device || true)}"
   [[ -n "${dev}" ]] || die "no ${VOLUME_NAME} volume found; run create first"
-  if [[ "${skip_empty}" == "1" && -n "$(mounted_at "${MOUNT_POINT}")" ]]; then
-    echo "already mounted at ${MOUNT_POINT}"
+  if trial_already_blocked; then
+    echo "already blocking triald at ${MOUNT_POINT} (read-only)"
     return 0
   fi
   if [[ -n "$(mounted_at "${MOUNT_POINT}")" ]]; then
@@ -453,12 +653,12 @@ mount_partition() {
     diskutil unmount "${dev}" >/dev/null
   fi
   empty_mount_dir "${MOUNT_POINT}"
-  echo "mounting ${dev} at ${MOUNT_POINT}"
-  diskutil mount nobrowse -mountPoint "${MOUNT_POINT}" "${dev}"
+  echo "mounting ${dev} read-only at ${MOUNT_POINT}"
+  diskutil mount readOnly nobrowse -mountPoint "${MOUNT_POINT}" "${dev}"
   DEVICE="${dev}"
   fill_volume
   save_state
-  echo "mounted ${VOLUME_NAME} at ${MOUNT_POINT}"
+  report_mount
 }
 
 unmount_partition() {
@@ -469,9 +669,8 @@ unmount_partition() {
     diskutil unmount force "${DEVICE}" >/dev/null 2>&1 || true
   else
     echo "not mounted"
-    return 0
   fi
-  echo "unmounted"
+  lock_host_dir
 }
 
 destroy_partition() {
@@ -487,7 +686,12 @@ destroy_partition() {
 }
 
 auto_mount_loaded_system() {
-  launchctl print "system/${LAUNCHD_LABEL}" >/dev/null 2>&1
+  launchctl print "system/${SYSTEM_LAUNCHD_LABEL}" >/dev/null 2>&1 \
+    || launchctl print "system/${LAUNCHD_LABEL}" >/dev/null 2>&1
+}
+
+auto_mount_loaded_system_label() {
+  launchctl print "system/$1" >/dev/null 2>&1
 }
 
 auto_mount_loaded_user() {
@@ -495,23 +699,30 @@ auto_mount_loaded_user() {
 }
 
 write_launchd_plist() {
-  local self mp
+  local dest label image mp self
+  dest="$1"
+  label="$2"
+  image="$3"
+  mp="$4"
   self="$(xml_escape "$(installed_fapple)")"
-  mp="$(xml_escape "${MOUNT_POINT}")"
-  mkdir -p "${STATE_DIR}"
-  cat > "${LAUNCHD_PLIST}" <<EOF
+  image="$(xml_escape "${image}")"
+  mp="$(xml_escape "${mp}")"
+  mkdir -p "$(dirname "${dest}")" "${STATE_DIR}"
+  cat > "${dest}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${LAUNCHD_LABEL}</string>
+  <string>${label}</string>
   <key>Disabled</key>
   <false/>
   <key>ProgramArguments</key>
   <array>
     <string>${self}</string>
     <string>automount</string>
+    <string>--image</string>
+    <string>${image}</string>
     <string>--mount-point</string>
     <string>${mp}</string>
   </array>
@@ -525,13 +736,13 @@ write_launchd_plist() {
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>${STATE_DIR}/launchd.out.log</string>
+  <string>${STATE_DIR}/${label}.out.log</string>
   <key>StandardErrorPath</key>
-  <string>${STATE_DIR}/launchd.err.log</string>
+  <string>${STATE_DIR}/${label}.err.log</string>
 </dict>
 </plist>
 EOF
-  chmod 644 "${LAUNCHD_PLIST}"
+  chmod 644 "${dest}"
 }
 
 write_user_launchd_plist() {
@@ -602,19 +813,24 @@ disable_legacy_auto_mount() {
 }
 
 enable_auto_mount_daemon() {
-  resolve_image_path
-  [[ -f "${IMAGE_PATH}" ]] || die "no image at ${IMAGE_PATH}; run: sudo $0 create"
-  [[ -n "${MOUNT_POINT}" ]] || die "no mount point; pass --mount-point PATH"
-  write_launchd_plist
-  if auto_mount_loaded_system; then
+  need_root "enable-auto-mount"
+  ensure_hfs_image "${SYSTEM_IMAGE_PATH}" "${SYSTEM_VOLUME_NAME}"
+  write_launchd_plist "${SYSTEM_LAUNCHD_PLIST}" "${SYSTEM_LAUNCHD_LABEL}" \
+    "${SYSTEM_IMAGE_PATH}" "${SYSTEM_MOUNT}"
+  if auto_mount_loaded_system_label "${SYSTEM_LAUNCHD_LABEL}"; then
+    launchctl bootout "system/${SYSTEM_LAUNCHD_LABEL}" 2>/dev/null || true
+  fi
+  if auto_mount_loaded_system_label "${LAUNCHD_LABEL}"; then
     launchctl bootout "system/${LAUNCHD_LABEL}" 2>/dev/null || true
   fi
-  launchctl bootstrap system "${LAUNCHD_PLIST}"
-  launchctl enable "system/${LAUNCHD_LABEL}" >/dev/null 2>&1 || true
-  disable_legacy_auto_mount
-  echo "enabled auto-mount at boot: ${LAUNCHD_PLIST}"
-  echo "  image:       ${IMAGE_PATH}"
-  echo "  mount point: ${MOUNT_POINT}"
+  if [[ -f "${LAUNCHD_PLIST}" ]]; then
+    rm -f "${LAUNCHD_PLIST}"
+  fi
+  launchctl bootstrap system "${SYSTEM_LAUNCHD_PLIST}"
+  launchctl enable "system/${SYSTEM_LAUNCHD_LABEL}" >/dev/null 2>&1 || true
+  echo "enabled auto-mount at boot: ${SYSTEM_LAUNCHD_PLIST}"
+  echo "  image:       ${SYSTEM_IMAGE_PATH}"
+  echo "  mount point: ${SYSTEM_MOUNT}"
 }
 
 enable_auto_mount_agent() {
@@ -622,12 +838,14 @@ enable_auto_mount_agent() {
   dest="$(user_image_path)"
   plist="$(user_plist_path)"
   uid="$(user_uid)"
+  MOUNT_POINT="$(default_mount_point)"
   resolve_image_path
   src=""
   if [[ -r "${IMAGE_PATH}" ]]; then
     src="${IMAGE_PATH}"
   fi
   mkdir -p "$(dirname "${dest}")"
+  chflags nouchg "${dest}" 2>/dev/null || true
   if [[ ! -f "${dest}" ]]; then
     [[ -n "${src}" ]] || die "no 1 MB disk at ${IMAGE_PATH} or ${dest}; run: sudo $0 create"
     cp -p "${src}" "${dest}"
@@ -635,8 +853,8 @@ enable_auto_mount_agent() {
   else
     echo "using existing user image ${dest}"
   fi
-  chmod u+rw "${dest}" 2>/dev/null || true
   IMAGE_PATH="${dest}"
+  harden_image_file
 
   write_user_launchd_plist "${plist}"
   if auto_mount_loaded_user; then
@@ -656,19 +874,26 @@ enable_auto_mount() {
   fi
   if [[ ${EUID} -eq 0 ]]; then
     enable_auto_mount_daemon
+    enable_auto_mount_agent
   else
     enable_auto_mount_agent
   fi
+  disable_legacy_auto_mount
 }
 
 disable_auto_mount_daemon() {
-  if auto_mount_loaded_system; then
-    launchctl bootout "system/${LAUNCHD_LABEL}" 2>/dev/null || true
-  fi
-  if [[ -f "${LAUNCHD_PLIST}" ]]; then
-    rm -f "${LAUNCHD_PLIST}"
-    echo "removed ${LAUNCHD_PLIST}"
-  fi
+  local label
+  for label in "${SYSTEM_LAUNCHD_LABEL}" "${LAUNCHD_LABEL}"; do
+    if auto_mount_loaded_system_label "${label}"; then
+      launchctl bootout "system/${label}" 2>/dev/null || true
+    fi
+  done
+  for f in "${SYSTEM_LAUNCHD_PLIST}" "${LAUNCHD_PLIST}"; do
+    if [[ -f "${f}" ]]; then
+      rm -f "${f}"
+      echo "removed ${f}"
+    fi
+  done
 }
 
 disable_auto_mount_agent() {
@@ -705,34 +930,65 @@ install_self() {
     die "cannot write ${dest}; run: sudo $0 install"
   fi
   echo "installed ${dest}"
+  occupy_defaults
+  enable_auto_mount
+}
+
+print_one_status() {
+  local title="$1"
+  local image="$2"
+  local mp="$3"
+  local saved_mp saved_img
+  saved_mp="${MOUNT_POINT}"
+  saved_img="${IMAGE_PATH}"
+  MOUNT_POINT="${mp}"
+  IMAGE_PATH="${image}"
+  echo "${title}"
+  echo "  mount point:  ${mp}"
+  echo "  image:        ${image}$([[ -f "${image}" ]] && echo " (exists)" || echo " (missing)")"
+  echo "  mounted at:   $(mounted_at "${mp}" || echo "not mounted")"
+  if [[ -n "$(mounted_at "${mp}")" ]]; then
+    echo "  free space:   $(volume_free_bytes || echo unknown) bytes"
+    if is_readonly_mount "${mp}"; then
+      echo "  mount flags:  read-only"
+    else
+      echo "  mount flags:  read-write"
+    fi
+    if trial_is_writable; then
+      echo "  writes:       OPEN — triald can write"
+    else
+      echo "  writes:       blocked"
+    fi
+  fi
+  MOUNT_POINT="${saved_mp}"
+  IMAGE_PATH="${saved_img}"
 }
 
 print_status() {
   resolve_image_path
   echo "mode:         ${MODE}"
-  echo "volume name:  ${VOLUME_NAME}"
   echo "size:         1 MB (not 1 GB)"
-  echo "mount point:  ${MOUNT_POINT}"
-  echo "image:        ${IMAGE_PATH}$([[ -f "${IMAGE_PATH}" ]] && echo " (exists)" || echo " (missing)")"
-  echo "device:       ${DEVICE:-$(volume_device || echo none)}"
-  echo "mounted at:   $(mounted_at "${MOUNT_POINT}" || echo "not mounted")"
-  if [[ -f "${LAUNCHD_PLIST}" ]] && auto_mount_loaded_system; then
-    echo "auto-mount:   enabled at boot (${LAUNCHD_PLIST})"
-  elif auto_mount_loaded_user; then
-    echo "auto-mount:   enabled at login ($(user_plist_path))"
-  elif [[ -f "$(user_plist_path)" ]]; then
-    echo "auto-mount:   plist present but not loaded ($(user_plist_path))"
-  elif [[ -f "${LAUNCHD_PLIST}" ]]; then
-    echo "auto-mount:   plist present but not loaded (${LAUNCHD_PLIST})"
+  echo
+  print_one_status "user triald (~/Library/Trial):" "${IMAGE_PATH}" "$(default_mount_point)"
+  echo
+  print_one_status "triald_system (/Library/Trial):" "${SYSTEM_IMAGE_PATH}" "${SYSTEM_MOUNT}"
+  echo
+  if [[ -f "${SYSTEM_LAUNCHD_PLIST}" ]] && auto_mount_loaded_system_label "${SYSTEM_LAUNCHD_LABEL}"; then
+    echo "boot auto-mount:  enabled (${SYSTEM_LAUNCHD_PLIST})"
+  elif [[ -f "${SYSTEM_LAUNCHD_PLIST}" ]]; then
+    echo "boot auto-mount:  plist present but not loaded (${SYSTEM_LAUNCHD_PLIST})"
   else
-    echo "auto-mount:   disabled"
+    echo "boot auto-mount:  disabled"
+  fi
+  if auto_mount_loaded_user; then
+    echo "login auto-mount: enabled ($(user_plist_path))"
+  elif [[ -f "$(user_plist_path)" ]]; then
+    echo "login auto-mount: plist present but not loaded ($(user_plist_path))"
+  else
+    echo "login auto-mount: disabled"
   fi
   echo
   diskutil list
-  if [[ -f "${IMAGE_PATH}" ]]; then
-    echo
-    hdiutil info | awk -v img="${IMAGE_PATH}" 'BEGIN{p=0} $0~img{p=1} p{print} /^===/{if(p&&seen++) exit}'
-  fi
 }
 
 run_for_mode() {
@@ -823,16 +1079,55 @@ esac
 
 case "${CMD}" in
   status)              print_status ;;
-  create)              run_for_mode create ;;
-  mount)               run_for_mode mount 0 ;;
   automount)           run_for_mode mount 1 ;;
-  unmount)             run_for_mode unmount ;;
-  destroy)             run_for_mode destroy ;;
   enable-auto-mount)   enable_auto_mount ;;
   disable-auto-mount)  disable_auto_mount ;;
-  up)
-    run_for_mode create
-    run_for_mode mount 0
+  create)
+    if [[ -n "${CLI_MOUNT}" || -n "${CLI_IMAGE}" ]]; then
+      run_for_mode create
+    else
+      resolve_image_path
+      ensure_hfs_image "${IMAGE_PATH}" "${VOLUME_NAME}"
+      if [[ ${EUID} -eq 0 ]]; then
+        ensure_hfs_image "${SYSTEM_IMAGE_PATH}" "${SYSTEM_VOLUME_NAME}"
+      fi
+    fi
+    ;;
+  mount|up)
+    if [[ -n "${CLI_MOUNT}" ]]; then
+      run_for_mode create
+      run_for_mode mount 0
+    else
+      occupy_defaults
+    fi
+    ;;
+  unmount)
+    if [[ -n "${CLI_MOUNT}" ]]; then
+      run_for_mode unmount
+    else
+      IMAGE_PATH="$(pick_existing_image || true)"
+      MOUNT_POINT="$(default_mount_point)"
+      run_for_mode unmount
+      if [[ ${EUID} -eq 0 ]]; then
+        IMAGE_PATH="${SYSTEM_IMAGE_PATH}"
+        MOUNT_POINT="${SYSTEM_MOUNT}"
+        run_for_mode unmount
+      fi
+    fi
+    ;;
+  destroy)
+    if [[ -n "${CLI_MOUNT}" ]]; then
+      run_for_mode destroy
+    else
+      IMAGE_PATH="$(pick_existing_image || echo "${IMAGE_PATH}")"
+      MOUNT_POINT="$(default_mount_point)"
+      run_for_mode destroy
+      if [[ ${EUID} -eq 0 ]]; then
+        IMAGE_PATH="${SYSTEM_IMAGE_PATH}"
+        MOUNT_POINT="${SYSTEM_MOUNT}"
+        run_for_mode destroy
+      fi
+    fi
     ;;
   *)
     die "unknown command: ${CMD}"
