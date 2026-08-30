@@ -5,11 +5,11 @@ TOUCH ?= /usr/bin/touch
 USER_TRIAL ?= $(HOME)/Library/Trial
 SYSTEM_TRIAL ?= /Library/Trial
 
-.PHONY: install uninstall test
+.PHONY: install uninstall reinstall test
 
 # Copies fapple to $(BINDIR), occupies ~/Library/Trial and /Library/Trial,
 # and installs login + boot auto-mount jobs. Needs sudo for /Library/Trial.
-# If fapple is already installed, only occupies this user's ~/Library/Trial.
+# Re-running with sudo occupies both Trial dirs again (does not skip system).
 install:
 	./fapple install
 
@@ -17,6 +17,10 @@ uninstall:
 	-./fapple disable-auto-mount
 	-./fapple unmount
 	rm -f $(DESTDIR)$(BINDIR)/fapple
+
+# Unmount, remove the installed binary, then install again. Occupies both
+# Trial dirs and rebuilds login + boot auto-mount. Needs sudo for /Library/Trial.
+reinstall: uninstall install
 
 # After sudo make install (and after logout/login or reboot).
 # Both Trial mounts must reject writes.

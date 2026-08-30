@@ -11,14 +11,14 @@ Apple runs two jobs. Neither can be lastingly disabled (SIP + XPC restart them):
 | `/usr/libexec/triald` (LaunchAgent) | `~/Library/Trial` |
 | `/usr/libexec/triald_system` (LaunchDaemon) | `/Library/Trial` |
 
-`fapple` occupies **both** (system path needs sudo). It does **not** try to stop the daemons. It deletes files that are not open, then attaches the 1 MB disk before they recreate anything. Open files are skipped until the holder drops the FD; if they remain, `triald` is signaled only so FDs drop — it will restart onto the read-only mount.
+`fapple` occupies **both** (system path needs sudo). It does **not** try to disable the daemons (SIP + XPC would restart them). It kills processes that have files open under `~/Library/Trial` and `/Library/Trial`, removes those files, then attaches the 1 MB disk before the daemons recreate anything. `triald` / `triald_system` restart onto the read-only mount.
 
 The daemons can still *run*; they just cannot store experiment data.
 
 ## What it does
 
 1. Reuses each existing 1 MB image (never 1 GB)
-2. Deletes unopened files under `~/Library/Trial` and `/Library/Trial`
+2. Kills processes holding files under `~/Library/Trial` and `/Library/Trial`, then deletes those files
 3. Mounts a 1 MB image **read-only** at each path
 4. Probes a write and fails if Trial would still be writable
 5. Remounts `~/Library/Trial` at login and `/Library/Trial` at boot
@@ -27,13 +27,17 @@ The daemons can still *run*; they just cannot store experiment data.
 
 ```bash
 sudo make install
+# or, to unmount, replace the binary, and occupy both Trial dirs again:
+sudo make reinstall
 # or
 sudo fapple install
 ```
 
 Copies `fapple` to `/usr/local/bin/fapple`, occupies both Trial dirs, and enables auto-mount.
 
-If `fapple` is already in `/usr/local/bin` (including when another user on this Mac runs `fapple install`), it only occupies that user's `~/Library/Trial` and enables their login auto-mount. It does not install the boot job, occupy `/Library/Trial`, or add a second background item.
+`sudo fapple install` occupies **both** Trial dirs and enables login + boot auto-mount, even if `/usr/local/bin/fapple` is already present. Without sudo it can only occupy `~/Library/Trial` and the login agent.
+
+If `df` or Finder shows `~/Library/Trial` or `/Library/Trial` as terabytes, the 1 MB image is **not mounted** and `triald` is writing to the host disk. `fapple status` must say `volume size: 1048576 bytes` and `1 MB image: yes` for both paths.
 
 ## Test after logout
 
@@ -42,7 +46,7 @@ sudo fapple install
 fapple status
 ```
 
-Both `~/Library/Trial` and `/Library/Trial` should show `writes: blocked` and `mount flags: read-only`.
+Both `~/Library/Trial` and `/Library/Trial` should show `writes: blocked`, `mount flags: read-only`, and `1 MB image: yes`.
 
 Then log out and back in (reboot if you also want the boot job for `/Library/Trial`). After login:
 
@@ -62,7 +66,7 @@ sudo touch /Library/Trial/x      # should fail: Read-only file system
 
 ```bash
 sudo fapple                 # occupy ~/Library/Trial and /Library/Trial
-sudo fapple mount           # same: empty unopened files, remount read-only
+sudo fapple mount           # same: kill holders, empty Trial dirs, remount read-only
 fapple status               # both paths must say writes: blocked
 sudo fapple unmount
 sudo fapple destroy
@@ -72,10 +76,14 @@ Success:
 
 ```
 user triald (~/Library/Trial):
+  volume size:  1048576 bytes
+  1 MB image:   yes
   writes:       blocked
   mount flags:  read-only
 
 triald_system (/Library/Trial):
+  volume size:  1048576 bytes
+  1 MB image:   yes
   writes:       blocked
   mount flags:  read-only
 ```

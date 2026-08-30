@@ -8,14 +8,16 @@
 #
 # User agent triald writes ~/Library/Trial. System daemon triald_system
 # writes /Library/Trial. Both get a 1 MB read-only image. Do not try to
-# disable the daemons — SIP / XPC will restart them. Delete files that
-# are not open, then mount before they recreate anything.
+# disable the daemons — SIP / XPC will restart them. Kill processes that
+# have files open under either Trial dir, remove those files, then mount
+# before the daemons recreate anything.
 set -euo pipefail
 
 VOLUME_NAME="fapple"
 LEGACY_VOLUME_NAME="trialdisk"
 # 1 megabyte. Do not change this to 1g / 1GB.
 SIZE="1m"
+IMAGE_BYTES=1048576
 IMAGE_FS="HFS+"
 IMAGE_LAYOUT="NONE"
 PARTITION_FS="MS-DOS"
@@ -58,8 +60,9 @@ fapple — make Trial dirs unwritable to triald / triald_system.
 
 1 MB on purpose so the volume is easy to fill, then mount read-only
 at ~/Library/Trial and (with sudo) /Library/Trial. Do not disable
-the daemons; they will restart. Delete files that are not open,
-then attach before they create new ones.
+the daemons; they will restart. Kill processes that have files open
+in the Trial dirs, remove those files, then attach before they
+create new ones.
 
 Usage:
   sudo fapple [command] [options]
@@ -67,13 +70,13 @@ Usage:
 Commands:
   up                  Create 1 MB disks if needed, then occupy both Trial dirs
   create              Create the 1 MB disk(s) only
-  mount               Empty Trial dirs (skip open files) and remount read-only
+  mount               Kill holders of Trial files, empty the dirs, remount read-only
   unmount             Unmount (images stay on disk)
   destroy             Unmount and delete the images
   enable-auto-mount   Remount at login, and at boot for /Library/Trial if sudo
   disable-auto-mount  Remove the login/boot auto-mount jobs
   install             Install to /usr/local/bin and occupy both Trial dirs.
-                      If already installed, only occupy this user's ~/Library/Trial
+                      Re-run with sudo occupies both even if already installed
   status              Print current disk / mount info
   help                Show this help
 
@@ -112,10 +115,15 @@ xml_escape() {
 }
 
 user_account() {
+  # LaunchDaemons have no USER / SUDO_USER. Never expand unset USER
+  # under `set -u` or the boot job dies and /Library/Trial stays on
+  # the host disk (terabytes free for triald_system).
   if [[ ${EUID} -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
     printf '%s' "${SUDO_USER}"
-  else
+  elif [[ -n "${USER:-}" ]]; then
     printf '%s' "${USER}"
+  else
+    id -un
   fi
 }
 
@@ -175,15 +183,22 @@ assert_size_is_small() {
 }
 
 safe_mount_point() {
-  local mp home
+  local mp home=""
   mp="$1"
-  home="$(user_home)"
+  home="$(user_home 2>/dev/null || true)"
   [[ "${mp}" == /* ]] || die "mount point must be an absolute path: ${mp}"
   case "${mp}" in
-    /|"/Users"|"${home}"|"${home}/Library"|"${home}/Library/"|"/Library"|"/Library/"|"/System"|"/System/"|"/System/Library"|"/System/Library/")
+    /|"/Users"|"/Library"|"/Library/"|"/System"|"/System/"|"/System/Library"|"/System/Library/")
       die "refusing to use ${mp} as a mount point"
       ;;
   esac
+  if [[ -n "${home}" ]]; then
+    case "${mp}" in
+      "${home}"|"${home}/Library"|"${home}/Library/")
+        die "refusing to use ${mp} as a mount point"
+        ;;
+    esac
+  fi
 }
 
 installed_fapple() {
@@ -195,13 +210,13 @@ installed_fapple() {
 }
 
 load_state() {
-  if [[ -r "${STATE_FILE}" ]]; then
+  local f
+  for f in "${STATE_FILE}" "${LEGACY_STATE_DIR}/state"; do
+    [[ -r "${f}" ]] || continue
     # shellcheck disable=SC1090
-    source "${STATE_FILE}"
-  elif [[ -r "${LEGACY_STATE_DIR}/state" ]]; then
-    # shellcheck disable=SC1090
-    source "${LEGACY_STATE_DIR}/state"
-  fi
+    source "${f}" 2>/dev/null || true
+    return 0
+  done
 }
 
 save_state() {
@@ -324,76 +339,107 @@ dir_has_children() {
   [[ -n "$(find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]]
 }
 
-# Delete names that are not open. Open files stay until the holder
-# drops the FD — do not disable triald; it will restart anyway.
-delete_unopened() {
+# PIDs with an open FD under mp. find always emits mp itself so xargs
+# never runs lsof with no arguments (which would list every process).
+open_holders() {
+  local mp="$1"
+  local pid
+  [[ -d "${mp}" ]] || return 0
+  while IFS= read -r pid; do
+    [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+    [[ "${pid}" != "$$" && "${pid}" != "${PPID}" ]] || continue
+    (( pid > 1 )) || continue
+    printf '%s\n' "${pid}"
+  done < <(find "${mp}" -print0 2>/dev/null | xargs -0 lsof -t 2>/dev/null | sort -u)
+}
+
+# Drop FDs so Trial files can be removed. triald / triald_system will
+# restart (SIP / XPC); that is expected.
+kill_open_holders() {
+  local mp="$1"
+  local sig="${2:-TERM}"
+  local pid comm
+  while IFS= read -r pid; do
+    [[ -n "${pid}" ]] || continue
+    comm="$(ps -p "${pid}" -o comm= 2>/dev/null || true)"
+    comm="${comm##*/}"
+    case "${comm}" in
+      launchd|kernel_task) continue ;;
+    esac
+    echo "killing ${comm:-pid} (${pid}) holding files in ${mp} (SIG${sig})"
+    kill -"${sig}" "${pid}" 2>/dev/null || true
+  done < <(open_holders "${mp}")
+}
+
+delete_contents() {
   local mp="$1"
   local f
   while IFS= read -r f; do
     [[ -e "${f}" || -L "${f}" ]] || continue
-    if lsof -t "${f}" >/dev/null 2>&1; then
-      echo "skip open file: ${f}"
-      continue
-    fi
+    chflags nouchg,noschg "${f}" 2>/dev/null || true
     /bin/rm -rf "${f}" 2>/dev/null || true
   done < <(find "${mp}" -depth -mindepth 1 2>/dev/null || true)
 }
 
-triald_holders() {
-  local mp="$1"
-  local pid comm
-  dir_has_children "${mp}" || return 0
-  while IFS= read -r pid; do
-    [[ -n "${pid}" && "${pid}" != "$$" && "${pid}" != "${PPID}" ]] || continue
-    comm="$(ps -p "${pid}" -o comm= 2>/dev/null || true)"
-    case "${comm}" in
-      *triald*) printf '%s\n' "${pid}" ;;
-    esac
-  done < <(find "${mp}" -print0 2>/dev/null | xargs -0 lsof -t 2>/dev/null | sort -u)
-}
-
 empty_mount_dir() {
   local mp="$1"
-  local i pids pid
-  local home
-  home="$(user_home)"
+  local i
+  local home=""
+  home="$(user_home 2>/dev/null || true)"
   safe_mount_point "${mp}"
   if [[ -n "$(mounted_at "${mp}")" ]]; then
     die "cannot empty ${mp}: still mounted"
   fi
   unlock_host_dir "${mp}"
-  if [[ ${EUID} -eq 0 && "${mp}" == "${home}"/* ]]; then
+  if [[ ${EUID} -eq 0 && -n "${home}" && "${mp}" == "${home}"/* ]]; then
     chown "$(user_account):staff" "${mp}" 2>/dev/null \
       || chown "$(user_account)" "${mp}" 2>/dev/null \
       || true
   fi
-  echo "deleting unopened files in ${mp}"
-  delete_unopened "${mp}"
-  for i in 1 2 3 4 5; do
+  echo "killing processes with open files in ${mp}"
+  for i in 1 2 3; do
     dir_has_children "${mp}" || return 0
-    echo "waiting for open files in ${mp} to close (${i}/5)"
-    sleep 1
-    delete_unopened "${mp}"
+    kill_open_holders "${mp}" TERM
+    sleep 0.3
+    echo "deleting files in ${mp}"
+    delete_contents "${mp}"
   done
   if dir_has_children "${mp}"; then
-    pids="$(triald_holders "${mp}" || true)"
-    if [[ -n "${pids}" ]]; then
-      echo "signaling triald holders so FDs drop (process will restart): ${pids}"
-      while IFS= read -r pid; do
-        [[ -n "${pid}" ]] || continue
-        kill -TERM "${pid}" 2>/dev/null || true
-      done <<<"${pids}"
-      sleep 0.4
-      delete_unopened "${mp}"
-    fi
+    echo "retrying with SIGKILL for remaining holders in ${mp}"
+    kill_open_holders "${mp}" KILL
+    sleep 0.3
+    delete_contents "${mp}"
   fi
   if dir_has_children "${mp}"; then
+    lock_host_dir "${mp}"
     die "mount point ${mp} is not empty (files still open)"
   fi
 }
 
 volume_free_bytes() {
   df -b "${MOUNT_POINT}" 2>/dev/null | awk 'NR==2 {print $4 * 512; exit}'
+}
+
+volume_total_bytes() {
+  df -b "${MOUNT_POINT}" 2>/dev/null | awk 'NR==2 {print $2 * 512; exit}'
+}
+
+image_file_bytes() {
+  stat -f%z "$1" 2>/dev/null || echo 0
+}
+
+# dmg file and mounted volume must be 1 MB, never the host APFS disk.
+image_is_1mb() {
+  local sz
+  [[ -f "$1" ]] || return 1
+  sz="$(image_file_bytes "$1")"
+  [[ "${sz}" -gt 0 && "${sz}" -le ${IMAGE_BYTES} ]]
+}
+
+mounted_volume_is_1mb() {
+  local total
+  total="$(volume_total_bytes || echo 0)"
+  [[ -n "${total}" && "${total}" -gt 0 && "${total}" -le ${IMAGE_BYTES} ]]
 }
 
 is_readonly_mount() {
@@ -426,10 +472,12 @@ attach_image() {
   hdiutil "${args[@]}"
 }
 
-# Fill until ENOSPC when the volume is writable. Then the image is
-# remounted read-only so triald cannot delete the filler and write.
+# Fill until ENOSPC when the volume is writable. dd bs=4096 leaves up
+# to one allocation-block of slack — follow with 512 then 1-byte pads
+# so a RW remount still cannot create files. Then the image is mounted
+# read-only so triald cannot delete the filler.
 fill_volume() {
-  local dest free
+  local dest free i
   dest="${MOUNT_POINT}/filler.binary"
   trial_is_writable || {
     echo "Trial is not writable"
@@ -439,6 +487,15 @@ fill_volume() {
   [[ -n "${free}" && "${free}" -gt 0 ]] || return 0
   echo "filling ${MOUNT_POINT} so a RW remount would still be full"
   dd if=/dev/zero of="${dest}" bs=4096 conv=notrunc 2>/dev/null || true
+  dd if=/dev/zero of="${MOUNT_POINT}/filler.512" bs=512 conv=notrunc 2>/dev/null || true
+  i=0
+  while trial_is_writable && [[ ${i} -lt 64 ]]; do
+    dd if=/dev/zero of="${MOUNT_POINT}/filler.pad.${i}" bs=1 count=512 2>/dev/null || break
+    i=$((i + 1))
+  done
+  chflags uchg "${dest}" "${MOUNT_POINT}/filler.512" "${MOUNT_POINT}"/filler.pad.* 2>/dev/null || true
+  free="$(volume_free_bytes || echo 0)"
+  echo "filled ${MOUNT_POINT}; free space: ${free} bytes"
 }
 
 verify_unwritable() {
@@ -453,10 +510,15 @@ verify_unwritable() {
 }
 
 report_mount() {
-  local free
+  local free total
   free="$(volume_free_bytes || echo unknown)"
+  total="$(volume_total_bytes || echo unknown)"
   echo "mounted ${VOLUME_NAME} at ${MOUNT_POINT}"
+  echo "volume size: ${total} bytes"
   echo "free space: ${free} bytes"
+  if ! mounted_volume_is_1mb; then
+    die "${MOUNT_POINT} is ${total} bytes, not the 1 MB image — triald would write to the host disk"
+  fi
   verify_unwritable
 }
 
@@ -464,19 +526,22 @@ trial_already_blocked() {
   [[ -n "$(mounted_at "${MOUNT_POINT}")" ]] || return 1
   is_readonly_mount "${MOUNT_POINT}" || return 1
   trial_is_writable && return 1
+  mounted_volume_is_1mb || return 1
   return 0
 }
 
 ensure_hfs_image() {
   local path="$1"
   local vol="$2"
+  local sz
   assert_size_is_small
-  if [[ -f "${path}" ]] && image_is_hfs "${path}"; then
+  if [[ -f "${path}" ]] && image_is_hfs "${path}" && image_is_1mb "${path}"; then
     echo "1 MB disk already exists: ${path}"
     return 0
   fi
   if [[ -f "${path}" ]]; then
-    echo "replacing non-HFS image ${path}"
+    sz="$(image_file_bytes "${path}")"
+    echo "replacing image ${path} (${sz} bytes, must be 1 MB HFS+)"
     chflags nouchg "${path}" 2>/dev/null || true
     chmod u+w "${path}" 2>/dev/null || true
     rm -f "${path}"
@@ -490,17 +555,15 @@ ensure_hfs_image() {
     -volname "${vol}" \
     -ov \
     "${path}" >/dev/null
-  echo "created ${path}"
+  sz="$(image_file_bytes "${path}")"
+  if [[ "${sz}" -gt ${IMAGE_BYTES} ]]; then
+    rm -f "${path}"
+    die "hdiutil created a ${sz} byte image at ${path}; refusing anything over 1 MB"
+  fi
+  echo "created ${path} (${sz} bytes)"
 }
 
 create_image() {
-  local existing
-  if existing="$(pick_existing_image)" && image_is_hfs "${existing}"; then
-    IMAGE_PATH="${existing}"
-    echo "1 MB disk already exists: ${IMAGE_PATH}"
-    save_state
-    return 0
-  fi
   ensure_hfs_image "${IMAGE_PATH}" "${VOLUME_NAME}"
   save_state
 }
@@ -566,6 +629,7 @@ mount_image() {
   echo "attaching ${IMAGE_PATH} read-only at ${MOUNT_POINT}"
   if ! attach_out="$(attach_image 1 2>&1)"; then
     echo "${attach_out}" >&2
+    lock_host_dir "${MOUNT_POINT}"
     if [[ "${attach_out}" == *"no mountable file systems"* ]]; then
       die "attach failed at ${MOUNT_POINT}. MS-DOS/FAT will not mount on ~/Library; recreate as HFS+"
     fi
@@ -718,6 +782,11 @@ write_launchd_plist() {
   <string>${label}</string>
   <key>Disabled</key>
   <false/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
+  </dict>
   <key>ProgramArguments</key>
   <array>
     <string>${self}</string>
@@ -763,6 +832,11 @@ write_user_launchd_plist() {
   <string>${LAUNCHD_LABEL}</string>
   <key>Disabled</key>
   <false/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
+  </dict>
   <key>LimitLoadToSessionType</key>
   <string>Aqua</string>
   <key>ProgramArguments</key>
@@ -944,10 +1018,9 @@ update_installed_copy() {
   return 1
 }
 
-# First-time install copies the binary, occupies both Trial dirs, and
-# enables login + boot auto-mount. If the binary is already in place
-# (another user on this Mac, or a re-run), only this user's
-# ~/Library/Trial is occupied — no LaunchDaemon, no /Library/Trial.
+# Copy the binary if dest is writable, occupy Trial dirs, and enable
+# auto-mount. sudo occupies both ~/Library/Trial and /Library/Trial
+# (and the boot job) even when the binary is already in place.
 install_self() {
   local src dest
   src="$(script_self)"
@@ -959,17 +1032,13 @@ install_self() {
     else
       echo "already installed: ${dest} (script not rewritten; needs sudo to update)"
     fi
-    echo "occupying this user's $(default_mount_point) only"
-    occupy_target "$(user_image_path)" "$(default_mount_point)" "${VOLUME_NAME:-fapple}"
-    enable_auto_mount_agent
-    return 0
+  else
+    mkdir -p "$(dirname "${dest}")"
+    if ! install -m 0755 "${src}" "${dest}" 2>/dev/null; then
+      die "cannot write ${dest}; run: sudo $0 install"
+    fi
+    echo "installed ${dest}"
   fi
-
-  mkdir -p "$(dirname "${dest}")"
-  if ! install -m 0755 "${src}" "${dest}" 2>/dev/null; then
-    die "cannot write ${dest}; run: sudo $0 install"
-  fi
-  echo "installed ${dest}"
   occupy_defaults
   enable_auto_mount
 }
@@ -988,7 +1057,13 @@ print_one_status() {
   echo "  image:        ${image}$([[ -f "${image}" ]] && echo " (exists)" || echo " (missing)")"
   echo "  mounted at:   $(mounted_at "${mp}" || echo "not mounted")"
   if [[ -n "$(mounted_at "${mp}")" ]]; then
+    echo "  volume size:  $(volume_total_bytes || echo unknown) bytes"
     echo "  free space:   $(volume_free_bytes || echo unknown) bytes"
+    if mounted_volume_is_1mb; then
+      echo "  1 MB image:   yes"
+    else
+      echo "  1 MB image:   NO — this is the host disk; triald can write"
+    fi
     if is_readonly_mount "${mp}"; then
       echo "  mount flags:  read-only"
     else
@@ -999,6 +1074,9 @@ print_one_status() {
     else
       echo "  writes:       blocked"
     fi
+  else
+    echo "  volume size:  not mounted (host folder, not 1 MB)"
+    echo "  writes:       OPEN — triald can write"
   fi
   MOUNT_POINT="${saved_mp}"
   IMAGE_PATH="${saved_img}"
